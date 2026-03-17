@@ -1,0 +1,510 @@
+"""
+LPG Supply Chain CSV Generator
+================================
+Reads a GEM pipeline GeoJSON file (any structure) and produces:
+  - nodes.csv  : supply chain nodes with capacity/demand in MT/day
+  - edges.csv  : directed edges with cost, transit time, reliability
+
+Usage:
+    pip install ijson
+    python generate_supply_chain_csvs.py --input your_file.json
+
+Auto-detects JSON structure:
+  - GeoJSON FeatureCollection  { "type": "FeatureCollection", "features": [...] }
+  - Plain array                [ { "type": "Feature", ... }, ... ]
+  - Newline-delimited JSON     one feature per line
+"""
+
+import json
+import csv
+import argparse
+import sys
+import os
+import re
+import math
+from itertools import combinations
+
+try:
+    import ijson
+    HAS_IJSON = True
+except ImportError:
+    HAS_IJSON = False
+    print("[WARN] ijson not installed. Will try to load entire file into memory.")
+    print("       For 65MB+ files, run: pip install ijson")
+
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION — tweak these to match your domain knowledge
+# ---------------------------------------------------------------------------
+
+# Capacity unit conversion → MT/day
+# LPG density ≈ 0.55 kg/L = 550 kg/m³
+UNIT_CONVERSIONS = {
+    "mmcf/d":  lambda x: x * 164724 * 0.00054,   # MMcf/d → BOE/d → MT/day (LPG approx)
+    "bcm/y":   lambda x: x * 1e9 / 365 * 0.00054,
+    "boe/d":   lambda x: x * 0.00054,
+    "mt/y":    lambda x: x / 365,
+    "mt/day":  lambda x: x,
+    "kt/y":    lambda x: x * 1000 / 365,
+    "tpd":     lambda x: x,
+    "mmtpa":   lambda x: x * 1e6 / 365,
+}
+
+# Keywords used to classify node types from name/location strings
+NODE_TYPE_KEYWORDS = {
+    "import_port": [
+        "port", "terminal", "jetty", "berth", "harbour", "harbor",
+        "kandla", "mundra", "nhava sheva", "haldia", "paradip",
+        "vizag", "visakhapatnam", "ennore", "kochi", "mangalore",
+        "hazira", "dahej", "dhamra", "kamarajar"
+    ],
+    "domestic_refinery": [
+        "refinery", "refining", "petrochemical", "nrl", "bpcl", "hpcl",
+        "iocl", "ongc", "reliance", "essar", "numaligarh", "barauni",
+        "mathura", "panipat", "gujarat refinery", "koyali", "bina",
+        "tatipaka", "digboi"
+    ],
+    "bottling_cluster": [
+        "bottling", "filling", "lpg plant", "cylinder", "lpo",
+        "bottling plant", "filling plant", "distribution center"
+    ],
+    "market_region": [
+        "market", "region", "zone", "district", "city", "urban",
+        "rural", "state", "consumer"
+    ],
+}
+
+# Countries treated as international LPG sources
+INTERNATIONAL_SOURCE_COUNTRIES = {
+    "Saudi Arabia", "Kuwait", "Qatar", "UAE", "United Arab Emirates",
+    "Iran", "Iraq", "Oman", "Bahrain", "Algeria", "Nigeria",
+    "Angola", "Libya", "Russia", "United States", "Australia",
+    "Malaysia", "Indonesia", "Trinidad and Tobago", "Norway"
+}
+
+# Fixed costs ₹/MT by edge type (source_type → target_type)
+EDGE_COSTS = {
+    ("international_source", "import_port"):      4500,   # sea freight
+    ("import_port",          "bottling_cluster"):  800,   # pipeline/coastal
+    ("import_port",          "market_region"):    1200,   # direct distribution
+    ("domestic_refinery",    "bottling_cluster"):  600,   # pipeline
+    ("domestic_refinery",    "market_region"):     900,   # pipeline/road
+    ("bottling_cluster",     "market_region"):     350,   # last-mile road
+    ("international_source", "domestic_refinery"): 3800,  # sea + port handling
+}
+
+# Typical transit times in days by edge type
+EDGE_TRANSIT_DAYS = {
+    ("international_source", "import_port"):      18,
+    ("import_port",          "bottling_cluster"):  3,
+    ("import_port",          "market_region"):     5,
+    ("domestic_refinery",    "bottling_cluster"):  2,
+    ("domestic_refinery",    "market_region"):     4,
+    ("bottling_cluster",     "market_region"):     1,
+    ("international_source", "domestic_refinery"): 22,
+}
+
+# Reliability scores by edge type (0–1)
+EDGE_RELIABILITY = {
+    ("international_source", "import_port"):      0.88,
+    ("import_port",          "bottling_cluster"):  0.93,
+    ("import_port",          "market_region"):     0.91,
+    ("domestic_refinery",    "bottling_cluster"):  0.95,
+    ("domestic_refinery",    "market_region"):     0.92,
+    ("bottling_cluster",     "market_region"):     0.97,
+    ("international_source", "domestic_refinery"): 0.85,
+}
+
+# Demand estimates MT/day by node type (used when no demand data in source)
+DEFAULT_DEMAND = {
+    "international_source": 0,
+    "import_port":          0,
+    "domestic_refinery":    0,
+    "bottling_cluster":     150,
+    "market_region":        300,
+}
+
+# Fraction of capacity used as demand (when no explicit demand field)
+DEMAND_FRACTION = {
+    "bottling_cluster": 0.70,
+    "market_region":    0.85,
+}
+
+# Allowed flow directions (valid edge types, no backward flow)
+ALLOWED_FLOW = {
+    ("international_source", "import_port"),
+    ("international_source", "domestic_refinery"),
+    ("import_port",          "bottling_cluster"),
+    ("import_port",          "market_region"),
+    ("domestic_refinery",    "bottling_cluster"),
+    ("domestic_refinery",    "market_region"),
+    ("bottling_cluster",     "market_region"),
+}
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+def slugify(text: str) -> str:
+    """Convert a name to a clean node_id."""
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s_]", "", text)
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text[:60]
+
+
+def convert_capacity_to_mt_day(value_str, unit_str) -> float:
+    """Convert any capacity value to MT/day. Returns 0 if unknown."""
+    try:
+        value = float(str(value_str).replace(",", "").strip())
+        unit_key = str(unit_str).lower().strip()
+        for key, fn in UNIT_CONVERSIONS.items():
+            if key in unit_key:
+                return round(fn(value), 2)
+        return round(value, 2)  # assume MT/day if unit unknown
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def classify_node_type(name: str, start_loc: str, country: str) -> str:
+    """Determine node type from name keywords and country."""
+    combined = f"{name} {start_loc}".lower()
+
+    # International sources take priority — checked by country
+    if country and country.strip() not in ("India", ""):
+        if any(c in country for c in INTERNATIONAL_SOURCE_COUNTRIES):
+            return "international_source"
+
+    # For India-based nodes, check specific types in priority order:
+    # refinery > bottling > market > port
+    # (port keywords are broad, so check it last)
+    PRIORITY_ORDER = ["domestic_refinery", "bottling_cluster", "market_region", "import_port"]
+    for node_type in PRIORITY_ORDER:
+        keywords = NODE_TYPE_KEYWORDS[node_type]
+        if any(kw in combined for kw in keywords):
+            return node_type
+
+    # India-based unclassified → default to bottling_cluster
+    if country and "India" in country:
+        return "bottling_cluster"
+
+    return "international_source"
+
+
+def extract_coordinates(geometry: dict):
+    """Extract a representative lat/lon from GeoJSON geometry."""
+    if not geometry:
+        return None, None
+    geo_type = geometry.get("type", "")
+    coords = geometry.get("coordinates", [])
+    try:
+        if geo_type == "Point":
+            return round(coords[1], 4), round(coords[0], 4)
+        elif geo_type in ("LineString", "MultiPoint"):
+            mid = coords[len(coords) // 2]
+            return round(mid[1], 4), round(mid[0], 4)
+        elif geo_type == "MultiLineString":
+            flat = [pt for seg in coords for pt in seg]
+            if flat:
+                mid = flat[len(flat) // 2]
+                return round(mid[1], 4), round(mid[0], 4)
+        elif geo_type == "Polygon":
+            mid = coords[0][len(coords[0]) // 2]
+            return round(mid[1], 4), round(mid[0], 4)
+    except (IndexError, TypeError):
+        pass
+    return None, None
+
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Great-circle distance in km between two lat/lon points."""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ---------------------------------------------------------------------------
+# JSON STRUCTURE DETECTION
+# ---------------------------------------------------------------------------
+
+def detect_structure(filepath: str) -> str:
+    """
+    Returns one of:
+      'feature_collection'  — { "type": "FeatureCollection", "features": [...] }
+      'array'               — [ { ... }, ... ]
+      'ndjson'              — one JSON object per line
+    """
+    with open(filepath, "r", encoding="utf-8") as f:
+        head = f.read(2048).strip()
+
+    if head.startswith("{"):
+        try:
+            obj = json.loads(head + "}")  # try partial parse
+        except json.JSONDecodeError:
+            pass
+        return "feature_collection"
+    elif head.startswith("["):
+        return "array"
+    else:
+        return "ndjson"
+
+
+# ---------------------------------------------------------------------------
+# FEATURE STREAMING
+# ---------------------------------------------------------------------------
+
+def stream_features_ijson(filepath: str, structure: str):
+    """Yield GeoJSON feature dicts using ijson (memory-efficient)."""
+    with open(filepath, "rb") as f:
+        if structure == "feature_collection":
+            parser = ijson.items(f, "features.item")
+        elif structure == "array":
+            parser = ijson.items(f, "item")
+        else:
+            # ndjson — fall through to non-ijson path
+            yield from stream_features_ndjson(filepath)
+            return
+        for feature in parser:
+            yield feature
+
+
+def stream_features_ndjson(filepath: str):
+    """Yield features from newline-delimited JSON."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+
+def stream_features_stdlib(filepath: str, structure: str):
+    """Fallback: load entire file (use only if ijson unavailable)."""
+    print(f"[INFO] Loading full file into memory (~{os.path.getsize(filepath)//1024//1024} MB)…")
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if structure == "feature_collection":
+        yield from data.get("features", [])
+    elif structure == "array":
+        yield from data
+    else:
+        yield from stream_features_ndjson(filepath)
+
+
+def get_feature_stream(filepath: str, structure: str):
+    if HAS_IJSON and structure != "ndjson":
+        return stream_features_ijson(filepath, structure)
+    elif structure == "ndjson":
+        return stream_features_ndjson(filepath)
+    else:
+        return stream_features_stdlib(filepath, structure)
+
+
+# ---------------------------------------------------------------------------
+# MAIN PROCESSING
+# ---------------------------------------------------------------------------
+
+def process_features(filepath: str):
+    structure = detect_structure(filepath)
+    print(f"[INFO] Detected JSON structure: {structure}")
+
+    nodes = {}       # node_id → node dict
+    seen_edges = set()
+    edges = []
+
+    fuel_filter = {"gas", "lpg", "oil", "lng", "ngl", "petroleum"}
+
+    count = 0
+    skipped = 0
+
+    for feature in get_feature_stream(filepath, structure):
+        if not isinstance(feature, dict):
+            continue
+
+        props = feature.get("properties", {}) or {}
+        geometry = feature.get("geometry", {}) or {}
+
+        # Filter by fuel type — keep gas, LPG, oil, LNG, NGL
+        fuel = str(props.get("Fuel", "")).lower()
+        if fuel and not any(f in fuel for f in fuel_filter):
+            skipped += 1
+            continue
+
+        # Skip cancelled/shelved pipelines
+        status_raw = str(props.get("Status", "operating")).lower()
+        if status_raw in ("cancelled", "shelved", "proposed"):
+            skipped += 1
+            continue
+
+        count += 1
+
+        # --- Extract fields ---
+        name         = str(props.get("PipelineName", "") or "").strip()
+        start_loc    = str(props.get("StartLocation", "") or props.get("StartState/Province", "") or "").strip()
+        end_loc      = str(props.get("EndLocation", "")   or props.get("EndState/Province", "")   or "").strip()
+        start_country= str(props.get("StartCountryOrArea", "") or props.get("CountriesOrAreas", "")).strip()
+        end_country  = str(props.get("EndCountryOrArea", "")   or props.get("CountriesOrAreas", "")).strip()
+        capacity_val = props.get("Capacity") or props.get("CapacityBOEd") or 0
+        capacity_unit= str(props.get("CapacityUnits", "BOEd") or "BOEd")
+        owner        = str(props.get("Owner", "") or "").strip()
+        status       = "operating" if "operating" in status_raw else status_raw
+        length_km    = float(props.get("LengthKnownKm") or props.get("LengthMergedKm") or 0)
+
+        cap_mt_day   = convert_capacity_to_mt_day(capacity_val, capacity_unit)
+
+        # --- Build start node ---
+        if start_loc:
+            start_id = slugify(f"{start_loc}_{start_country}")
+            if start_id not in nodes:
+                start_type = classify_node_type(name, start_loc, start_country)
+                lat, lon   = extract_coordinates(geometry)
+                demand     = round(cap_mt_day * DEMAND_FRACTION.get(start_type, 0), 2)
+                nodes[start_id] = {
+                    "node_id":          start_id,
+                    "node_type":        start_type,
+                    "name":             start_loc,
+                    "country":          start_country,
+                    "owner":            owner,
+                    "status":           status,
+                    "capacity_mt_day":  cap_mt_day,
+                    "demand_mt_day":    demand,
+                    "latitude":         lat if lat else "",
+                    "longitude":        lon if lon else "",
+                }
+
+        # --- Build end node ---
+        if end_loc:
+            end_id   = slugify(f"{end_loc}_{end_country}")
+            if end_id not in nodes:
+                end_type = classify_node_type(name, end_loc, end_country)
+                lat, lon = extract_coordinates(geometry)
+                demand   = round(cap_mt_day * DEMAND_FRACTION.get(end_type, 0), 2)
+                nodes[end_id] = {
+                    "node_id":          end_id,
+                    "node_type":        end_type,
+                    "name":             end_loc,
+                    "country":          end_country,
+                    "owner":            owner,
+                    "status":           status,
+                    "capacity_mt_day":  cap_mt_day,
+                    "demand_mt_day":    demand,
+                    "latitude":         lat if lat else "",
+                    "longitude":        lon if lon else "",
+                }
+
+        # --- Build edge (directed, no duplicates) ---
+        if start_loc and end_loc and start_id != end_id:
+            src_type = nodes[start_id]["node_type"]
+            tgt_type = nodes[end_id]["node_type"]
+            flow     = (src_type, tgt_type)
+            edge_key = (start_id, end_id)
+
+            if flow in ALLOWED_FLOW and edge_key not in seen_edges:
+                seen_edges.add(edge_key)
+
+                cost      = EDGE_COSTS.get(flow, 500)
+                transit   = EDGE_TRANSIT_DAYS.get(flow, 5)
+                rel       = EDGE_RELIABILITY.get(flow, 0.90)
+
+                # Adjust cost by length if available
+                if length_km > 0 and flow not in [
+                    ("international_source", "import_port"),
+                    ("international_source", "domestic_refinery")
+                ]:
+                    cost = round(cost + length_km * 0.5, 2)  # ₹0.50/MT/km premium
+
+                edges.append({
+                    "edge_id":          f"{start_id}__{end_id}",
+                    "source_id":        start_id,
+                    "target_id":        end_id,
+                    "source_type":      src_type,
+                    "target_type":      tgt_type,
+                    "capacity_mt_day":  cap_mt_day,
+                    "cost_inr_per_mt":  cost,
+                    "transit_days":     transit,
+                    "reliability":      rel,
+                    "length_km":        round(length_km, 2),
+                    "status":           status,
+                })
+
+        if count % 5000 == 0:
+            print(f"[INFO] Processed {count:,} features, {len(nodes):,} nodes, {len(edges):,} edges…")
+
+    print(f"\n[DONE] Processed {count:,} features | Skipped {skipped:,}")
+    print(f"       Nodes: {len(nodes):,} | Edges: {len(edges):,}")
+    return list(nodes.values()), edges
+
+
+# ---------------------------------------------------------------------------
+# CSV WRITERS
+# ---------------------------------------------------------------------------
+
+NODE_COLUMNS = [
+    "node_id", "node_type", "name", "country", "owner",
+    "status", "capacity_mt_day", "demand_mt_day", "latitude", "longitude"
+]
+
+EDGE_COLUMNS = [
+    "edge_id", "source_id", "target_id", "source_type", "target_type",
+    "capacity_mt_day", "cost_inr_per_mt", "transit_days", "reliability",
+    "length_km", "status"
+]
+
+
+def write_csv(filepath: str, rows: list, columns: list):
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[OUT] Written: {filepath}  ({len(rows):,} rows)")
+
+
+def print_summary(nodes: list, edges: list):
+    from collections import Counter
+    print("\n=== NODE TYPE BREAKDOWN ===")
+    for t, c in sorted(Counter(n["node_type"] for n in nodes).items()):
+        print(f"  {t:<28} {c:>5}")
+    print("\n=== EDGE FLOW BREAKDOWN ===")
+    for t, c in sorted(Counter(f"{e['source_type']} → {e['target_type']}" for e in edges).items()):
+        print(f"  {t:<55} {c:>5}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate LPG supply chain CSVs from GEM pipeline JSON")
+    parser.add_argument("--input",  "-i", required=True,  help="Path to the GEM JSON file")
+    parser.add_argument("--nodes",  "-n", default="nodes.csv",  help="Output nodes CSV (default: nodes.csv)")
+    parser.add_argument("--edges",  "-e", default="edges.csv",  help="Output edges CSV (default: edges.csv)")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"[ERROR] File not found: {args.input}")
+        sys.exit(1)
+
+    file_mb = os.path.getsize(args.input) / 1024 / 1024
+    print(f"[INFO] Input file: {args.input}  ({file_mb:.1f} MB)")
+
+    nodes, edges = process_features(args.input)
+
+    if not nodes:
+        print("[WARN] No nodes extracted. Check your JSON file structure and fuel filter.")
+        sys.exit(1)
+
+    write_csv(args.nodes, nodes, NODE_COLUMNS)
+    write_csv(args.edges, edges, EDGE_COLUMNS)
+    print_summary(nodes, edges)
+    print("All done! nodes.csv and edges.csv are ready.")
+
+
+if __name__ == "__main__":
+    main()
